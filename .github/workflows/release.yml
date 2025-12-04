@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_NOLOGO: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          else
+            echo "version=$(date +'%Y.%m.%d')-preview" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
+
+      - name: Pack
+        run: dotnet pack ClaudeCodeWrapper/ClaudeCodeWrapper.csproj --configuration Release --no-build --output ./artifacts
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget-packages
+          path: ./artifacts/*.nupkg
+          retention-days: 5
+
+  publish-github:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: nuget-packages
+          path: ./artifacts
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Publish to GitHub Packages
+        run: |
+          for package in ./artifacts/*.nupkg; do
+            echo "📦 Publishing $package to GitHub Packages..."
+            dotnet nuget push "$package" \
+              --source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" \
+              --api-key ${{ secrets.GH_PKG_TOKEN }} \
+              --skip-duplicate
+          done
+
+  publish-nuget:
+    needs: build
+    runs-on: ubuntu-latest
+    # Only run if NUGET_API_KEY secret is configured
+    env:
+      HAS_NUGET_KEY: ${{ secrets.NUGET_API_KEY != '' }}
+
+    steps:
+      - name: Check for NuGet API Key
+        id: check
+        run: |
+          if [ "${{ secrets.NUGET_API_KEY }}" != "" ]; then
+            echo "has_key=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_key=false" >> $GITHUB_OUTPUT
+            echo "⚠️ NUGET_API_KEY not configured, skipping NuGet.org publish"
+          fi
+
+      - name: Download artifacts
+        if: steps.check.outputs.has_key == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: nuget-packages
+          path: ./artifacts
+
+      - name: Setup .NET
+        if: steps.check.outputs.has_key == 'true'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Publish to NuGet.org
+        if: steps.check.outputs.has_key == 'true'
+        run: |
+          for package in ./artifacts/*.nupkg; do
+            echo "📦 Publishing $package to NuGet.org..."
+            dotnet nuget push "$package" \
+              --source "https://api.nuget.org/v3/index.json" \
+              --api-key "${{ secrets.NUGET_API_KEY }}" \
+              --skip-duplicate
+          done
+
+  release:
+    needs: [build, publish-github]
+    if: always() && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: nuget-packages
+          path: ./artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: ./artifacts/*.nupkg
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, '-alpha') || contains(github.ref, '-beta') || contains(github.ref, '-rc') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

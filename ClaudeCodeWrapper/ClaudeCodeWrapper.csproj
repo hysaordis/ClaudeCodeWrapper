@@ -1,0 +1,36 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+    <!-- NuGet Package Metadata -->
+    <PackageId>ClaudeCodeWrapper</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>hysaordis</Authors>
+    <Company>hysaordis</Company>
+    <Description>C# wrapper for Claude Code CLI. Simple API: Initialize, Send, Stream with real-time activity monitoring.</Description>
+    <Copyright>Copyright © 2025</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/hysaordis/ClaudeCodeWrapper</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/hysaordis/ClaudeCodeWrapper</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>claude;anthropic;ai;llm;cli;agent;wrapper;claude-code</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageReleaseNotes>v1.0.0: Initial release. Clean API: ClaudeCode.Initialize(), SendAsync(), StreamAsync(). Real-time activity monitoring with sub-agent support.</PackageReleaseNotes>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <RootNamespace>ClaudeCodeWrapper</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="../README.md" Pack="true" PackagePath="/" />
+    <None Include="../CHANGELOG.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Reactive" Version="6.0.0" />
+  </ItemGroup>
+
+</Project>

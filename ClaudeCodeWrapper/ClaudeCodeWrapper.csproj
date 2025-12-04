@@ -8,10 +8,10 @@
     <!-- NuGet Package Metadata -->
     <PackageId>ClaudeCodeWrapper</PackageId>
     <Version>1.0.1</Version>
-    <Authors>hysaordis</Authors>
-    <Company>hysaordis</Company>
-    <Description>C# wrapper for Claude Code CLI. Simple API: Initialize, Send, Stream with real-time activity monitoring.</Description>
-    <Copyright>Copyright © 2025</Copyright>
+    <Authors>Ordis Hysa</Authors>
+    <Company>Ordis Hysa</Company>
+    <Description>C# wrapper for Claude Code CLI. Requires Claude Code CLI installed (npm install -g @anthropic-ai/claude-code). Simple API: Initialize, Send, Stream with real-time activity monitoring.</Description>
+    <Copyright>Copyright © 2025 Ordis Hysa</Copyright>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/hysaordis/ClaudeCodeWrapper</PackageProjectUrl>
     <RepositoryUrl>https://github.com/hysaordis/ClaudeCodeWrapper</RepositoryUrl>

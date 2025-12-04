@@ -252,6 +252,10 @@ public class ClaudeInstallationInfo
     /// </summary>
     public bool HasValidAuth { get; init; }
 
+    /// <summary>
+    /// Returns a string representation of the Claude installation status.
+    /// </summary>
+    /// <returns>A human-readable string describing the installation state.</returns>
     public override string ToString()
     {
         if (!IsInstalled)

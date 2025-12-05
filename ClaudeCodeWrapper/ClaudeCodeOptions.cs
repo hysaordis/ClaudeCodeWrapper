@@ -70,6 +70,23 @@ public class ClaudeCodeOptions
     /// Continue last session (internal use).
     /// </summary>
     internal bool ContinueLastSession { get; set; }
+
+    #region Usage Monitoring Options
+
+    /// <summary>
+    /// Enable usage monitoring via the Claude API.
+    /// When enabled, you can call GetUsageAsync() to check current usage limits.
+    /// Default: false.
+    /// </summary>
+    public bool EnableUsageMonitoring { get; set; } = false;
+
+    /// <summary>
+    /// How long to cache usage data before refetching from API.
+    /// Default: 1 minute.
+    /// </summary>
+    public TimeSpan UsageCacheExpiry { get; set; } = TimeSpan.FromMinutes(1);
+
+    #endregion
 }
 
 /// <summary>

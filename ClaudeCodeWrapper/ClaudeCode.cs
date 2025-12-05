@@ -1,7 +1,9 @@
 using System.Diagnostics;
 using System.Text;
+using System.Text.RegularExpressions;
 using ClaudeCodeWrapper.Formatters;
 using ClaudeCodeWrapper.Models;
+using ClaudeCodeWrapper.Services;
 using ClaudeCodeWrapper.Utilities;
 
 namespace ClaudeCodeWrapper;
@@ -9,16 +11,28 @@ namespace ClaudeCodeWrapper;
 /// <summary>
 /// Client for Claude Code CLI.
 /// </summary>
-public class ClaudeCode
+public class ClaudeCode : IDisposable
 {
+    private static readonly Regex RateLimitErrorPattern = new(
+        @"429\s*\{""type"":""error"",""error"":\{""type"":""rate_limit_error"",""message"":""([^""]+)""\},""request_id"":""([^""]+)""\}",
+        RegexOptions.Compiled);
+
     private readonly ClaudeCodeOptions _options;
     private readonly string _claudePath;
+    private readonly UsageMonitor? _usageMonitor;
     private const int FinalEventsDelayMs = 100;
+    private bool _disposed;
 
     private ClaudeCode(string claudePath, ClaudeCodeOptions options)
     {
         _claudePath = claudePath;
         _options = options;
+
+        // Initialize usage monitor only if enabled
+        if (options.EnableUsageMonitoring)
+        {
+            _usageMonitor = new UsageMonitor(options.UsageCacheExpiry);
+        }
     }
 
     /// <summary>
@@ -57,6 +71,11 @@ public class ClaudeCode
     /// </summary>
     public ClaudeCodeOptions Options => _options;
 
+    /// <summary>
+    /// Usage monitor for checking limits. Null if EnableUsageMonitoring is false.
+    /// </summary>
+    public UsageMonitor? UsageMonitor => _usageMonitor;
+
     #region Send Methods
 
     /// <summary>
@@ -86,6 +105,35 @@ public class ClaudeCode
         {
             _options.OutputFormat = originalFormat;
         }
+    }
+
+    #endregion
+
+    #region Usage Methods
+
+    /// <summary>
+    /// Get current usage information.
+    /// Returns null if usage monitoring is disabled or API is unavailable.
+    /// </summary>
+    public async Task<UsageInfo?> GetUsageAsync(CancellationToken cancellationToken = default)
+    {
+        return _usageMonitor != null
+            ? await _usageMonitor.GetUsageAsync(cancellationToken)
+            : null;
+    }
+
+    /// <summary>
+    /// Check if current usage is within the specified limits.
+    /// Returns true if monitoring is disabled (assumes OK).
+    /// </summary>
+    public async Task<bool> IsWithinLimitsAsync(
+        double sessionThreshold = 95,
+        double weeklyThreshold = 90,
+        CancellationToken cancellationToken = default)
+    {
+        return _usageMonitor != null
+            ? await _usageMonitor.IsWithinLimitsAsync(sessionThreshold, weeklyThreshold, cancellationToken)
+            : true;
     }
 
     #endregion
@@ -322,9 +370,89 @@ public class ClaudeCode
         var errorText = error.ToString();
 
         if (process.ExitCode != 0)
+        {
+            // Check for rate limit errors and throw specific exception
+            var combinedOutput = $"{outputText}\n{errorText}";
+            if (TryParseRateLimitError(combinedOutput, out var rateLimitException))
+            {
+                throw rateLimitException;
+            }
+
+            // Check for overloaded errors (529)
+            if (combinedOutput.Contains("529") && combinedOutput.Contains("overloaded"))
+            {
+                throw new OverloadedException(
+                    "Claude API is temporarily overloaded. Please retry later.",
+                    retryAfter: TimeSpan.FromMinutes(1));
+            }
+
             throw new ClaudeCodeException($"Claude CLI exited with code {process.ExitCode}: {errorText}");
+        }
 
         return outputText;
+    }
+
+    /// <summary>
+    /// Try to parse a rate limit error from CLI output.
+    /// </summary>
+    private static bool TryParseRateLimitError(string output, out RateLimitException exception)
+    {
+        exception = null!;
+
+        if (string.IsNullOrEmpty(output))
+            return false;
+
+        // Check for 429 rate limit error pattern
+        var match = RateLimitErrorPattern.Match(output);
+        if (match.Success)
+        {
+            var message = match.Groups[1].Value;
+            var requestId = match.Groups[2].Value;
+
+            exception = new RateLimitException(
+                message,
+                requestId: requestId,
+                errorType: "rate_limit_error");
+            return true;
+        }
+
+        // Check for generic rate limit indicators
+        if (output.Contains("429") &&
+            (output.Contains("rate_limit_error") || output.Contains("rate limit", StringComparison.OrdinalIgnoreCase)))
+        {
+            exception = new RateLimitException("Rate limit exceeded (429)");
+            return true;
+        }
+
+        return false;
+    }
+
+    #endregion
+
+    #region IDisposable
+
+    /// <summary>
+    /// Dispose resources.
+    /// </summary>
+    public void Dispose()
+    {
+        Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+
+    /// <summary>
+    /// Dispose resources.
+    /// </summary>
+    protected virtual void Dispose(bool disposing)
+    {
+        if (_disposed) return;
+
+        if (disposing)
+        {
+            _usageMonitor?.Dispose();
+        }
+
+        _disposed = true;
     }
 
     #endregion

@@ -7,7 +7,7 @@
 
     <!-- NuGet Package Metadata -->
     <PackageId>ClaudeCodeWrapper</PackageId>
-    <Version>1.0.1</Version>
+    <Version>1.1.0</Version>
     <Authors>Ordis Hysa</Authors>
     <Company>Ordis Hysa</Company>
     <Description>C# wrapper for Claude Code CLI. Requires Claude Code CLI installed (npm install -g @anthropic-ai/claude-code). Simple API: Initialize, Send, Stream with real-time activity monitoring.</Description>
@@ -18,7 +18,7 @@
     <RepositoryType>git</RepositoryType>
     <PackageTags>claude;anthropic;ai;llm;cli;agent;wrapper;claude-code</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <PackageReleaseNotes>v1.0.0: Initial release. Clean API: ClaudeCode.Initialize(), SendAsync(), StreamAsync(). Real-time activity monitoring with sub-agent support.</PackageReleaseNotes>
+    <PackageReleaseNotes>v1.1.0: Added UsageMonitor for tracking API usage limits. Added RateLimitException (429) and OverloadedException (529) for proper error handling. Automatic detection of rate limit errors from CLI output.</PackageReleaseNotes>
     <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <RootNamespace>ClaudeCodeWrapper</RootNamespace>

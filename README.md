@@ -79,6 +79,55 @@ var response = await claude.ContinueAsync("What were we discussing?");
 | `PermissionMode.AcceptEdits` | Auto-accept file edits |
 | `PermissionMode.BypassPermissions` | No permission prompts |
 
+## Usage Monitoring
+
+Track your API usage limits:
+
+```csharp
+var claude = ClaudeCode.Initialize(new ClaudeCodeOptions
+{
+    EnableUsageMonitoring = true
+});
+
+// Get current usage
+var usage = await claude.GetUsageAsync();
+if (usage != null)
+{
+    Console.WriteLine($"Session: {usage.FiveHour.Utilization}% used");
+    Console.WriteLine($"Weekly:  {usage.SevenDay.Utilization}% used");
+    Console.WriteLine($"Resets:  {usage.FiveHour.ResetsAt}");
+}
+
+// Check if within limits
+if (await claude.IsWithinLimitsAsync(sessionThreshold: 90, weeklyThreshold: 80))
+{
+    await claude.SendAsync("Safe to send!");
+}
+```
+
+## Error Handling
+
+The wrapper throws specific exceptions for rate limit errors:
+
+```csharp
+try
+{
+    var response = await claude.SendAsync(prompt);
+}
+catch (RateLimitException ex)
+{
+    // HTTP 429 - Rate limit exceeded
+    Console.WriteLine($"Rate limited: {ex.Message}");
+    Console.WriteLine($"Request ID: {ex.RequestId}");
+    // Implement your own retry logic
+}
+catch (OverloadedException ex)
+{
+    // HTTP 529 - API overloaded
+    Console.WriteLine($"API overloaded, retry after: {ex.RetryAfter}");
+}
+```
+
 ## License
 
 MIT

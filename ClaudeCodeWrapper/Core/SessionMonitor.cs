@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Reactive.Subjects;
+using System.Text;
 using ClaudeCodeWrapper.Models;
 using ClaudeCodeWrapper.Models.Records;
 
@@ -8,39 +9,41 @@ namespace ClaudeCodeWrapper.Core;
 /// <summary>
 /// Monitors Claude session logs and emits records as they occur.
 /// Implements IObservable for flexible event consumption using Reactive Extensions.
-///
-/// Usage:
-/// <code>
-/// var monitor = new SessionMonitor(new SessionMonitorOptions { WorkingDirectory = "/path/to/project" });
-/// monitor.Subscribe(record => Console.WriteLine($"{record.Type}: {record.Uuid}"));
-/// monitor.Start();
-/// // ... execute Claude commands ...
-/// monitor.Stop();
-/// monitor.Dispose();
-/// </code>
 /// </summary>
-public class SessionMonitor : IObservable<SessionRecord>, IDisposable
+public sealed class SessionMonitor : IObservable<SessionRecord>, IDisposable
 {
     private readonly SessionMonitorOptions _options;
-    private readonly Subject<SessionRecord> _subject = new();
+
+    // Subject emission must be serialized (Subject<T> isn't safe for concurrent OnNext).
+    private readonly Subject<SessionRecord> _rawSubject = new();
+    private readonly ISubject<SessionRecord> _subject;
+
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _fileLocks = new();
+
+    // Tracking state (thread-safe)
+    private readonly ConcurrentDictionary<string, byte> _trackedFiles = new();          // set
+    private readonly ConcurrentDictionary<string, long> _fileReadOffsets = new();       // filePath -> read offset (bytes read from file)
+    private readonly ConcurrentDictionary<string, byte[]> _fileTailBytes = new();       // filePath -> bytes of an incomplete last line
+
+    // Dedup (bounded)
+    private readonly ConcurrentDictionary<string, byte> _seenKeys = new();              // set
+    private readonly ConcurrentQueue<string> _seenOrder = new();
+    private readonly int _maxSeenKeys;
 
     private FileSystemWatcher? _parentDirectoryWatcher;
     private FileSystemWatcher? _projectDirectoryWatcher;
     private FileSystemWatcher? _sessionFileWatcher;
-    private Timer? _pollingTimer;
+
+    private CancellationTokenSource? _cts;
+    private Task? _pollingTask;
 
     private string? _sessionFilePath;
     private string? _projectDirectory;
     private string? _currentSessionId;
-    private long _lastPosition;
     private DateTime _watchStartTime;
+
     private bool _isMonitoring;
     private bool _disposed;
-
-    // Track multiple files (main session + agent files)
-    private readonly Dictionary<string, long> _filePositions = new();
-    private readonly HashSet<string> _trackedFiles = new();
 
     /// <summary>
     /// Polling interval in milliseconds (FileSystemWatcher can be unreliable on macOS).
@@ -48,62 +51,48 @@ public class SessionMonitor : IObservable<SessionRecord>, IDisposable
     private const int PollingIntervalMs = 100;
 
     /// <summary>
-    /// Creates a new session monitor with the specified options.
+    /// Upper bound per single read pass (prevents huge allocations if a file bursts).
     /// </summary>
+    private const int MaxReadBytesPerPass = 4 * 1024 * 1024; // 4MB
+
     public SessionMonitor(SessionMonitorOptions? options = null)
     {
         _options = options ?? new SessionMonitorOptions();
+
+        // Serialize emissions (thread-safe OnNext)
+        _subject = Subject.Synchronize(_rawSubject);
+
+        // Pick a conservative bounded size. If you want it configurable, add it to SessionMonitorOptions.
+        _maxSeenKeys = 100_000;
     }
 
-    /// <summary>
-    /// Current session ID being monitored (if known).
-    /// </summary>
     public string? CurrentSessionId => _currentSessionId;
 
-    /// <summary>
-    /// Whether monitoring is currently active.
-    /// </summary>
     public bool IsMonitoring => _isMonitoring;
 
-    /// <summary>
-    /// Path to the current session file.
-    /// </summary>
     public string? SessionFilePath => _sessionFilePath;
 
-    /// <summary>
-    /// All tracked files (main session + agents).
-    /// </summary>
-    public IReadOnlyCollection<string> TrackedFiles => _trackedFiles;
+    public IReadOnlyCollection<string> TrackedFiles => _trackedFiles.Keys.ToArray();
 
-    /// <summary>
-    /// Raised when an error occurs during monitoring.
-    /// </summary>
     public event EventHandler<Exception>? Error;
 
-    /// <summary>
-    /// Subscribe to session records.
-    /// </summary>
-    public IDisposable Subscribe(IObserver<SessionRecord> observer)
-    {
-        return _subject.Subscribe(observer);
-    }
+    public IDisposable Subscribe(IObserver<SessionRecord> observer) => _subject.Subscribe(observer);
 
     /// <summary>
-    /// Start monitoring for session activities.
-    /// Call this BEFORE starting Claude execution.
+    /// Start monitoring for session activities. Call this BEFORE starting Claude execution.
     /// </summary>
     public void Start()
     {
-        if (_disposed)
-            throw new ObjectDisposedException(nameof(SessionMonitor));
-
-        if (_isMonitoring)
-            return;
+        if (_disposed) throw new ObjectDisposedException(nameof(SessionMonitor));
+        if (_isMonitoring) return;
 
         _isMonitoring = true;
         _watchStartTime = DateTime.UtcNow;
-        _lastPosition = 0;
-        _sessionFilePath = null;
+
+        ResetStateForStart();
+
+        _cts = new CancellationTokenSource();
+        var token = _cts.Token;
 
         try
         {
@@ -111,36 +100,31 @@ public class SessionMonitor : IObservable<SessionRecord>, IDisposable
             if (!string.IsNullOrEmpty(_options.SessionId))
             {
                 StartWatchingSession(_options.SessionId);
-                return;
-            }
-
-            // Otherwise, watch for new session files in the project directory
-            var claudeProjectsDir = _options.GetClaudeProjectsPath();
-
-            if (!Directory.Exists(claudeProjectsDir))
-            {
-                return;
-            }
-
-            _projectDirectory = _options.GetDerivedProjectPath();
-
-            if (string.IsNullOrEmpty(_projectDirectory))
-            {
-                return;
-            }
-
-            if (Directory.Exists(_projectDirectory))
-            {
-                StartWatchingProjectDirectory();
-                ScanForSessionFiles();
             }
             else
             {
-                WatchForProjectDirectoryCreation(claudeProjectsDir);
+                // Otherwise, watch for new session files in the project directory
+                var claudeProjectsDir = _options.GetClaudeProjectsPath();
+                if (!Directory.Exists(claudeProjectsDir))
+                    return;
+
+                _projectDirectory = _options.GetDerivedProjectPath();
+                if (string.IsNullOrEmpty(_projectDirectory))
+                    return;
+
+                if (Directory.Exists(_projectDirectory))
+                {
+                    StartWatchingProjectDirectory(_projectDirectory);
+                    ScanForSessionFiles();
+                }
+                else
+                {
+                    WatchForProjectDirectoryCreation(claudeProjectsDir);
+                }
             }
 
-            // Start fallback polling timer - FileSystemWatcher can be unreliable on macOS
-            _pollingTimer = new Timer(OnPollingTimerCallback, null, 0, PollingIntervalMs);
+            // Poll loop (fallback)
+            _pollingTask = Task.Run(() => PollLoopAsync(token), token);
         }
         catch (Exception ex)
         {
@@ -153,8 +137,15 @@ public class SessionMonitor : IObservable<SessionRecord>, IDisposable
     /// </summary>
     public void Stop()
     {
+        if (!_isMonitoring) return;
+
         _isMonitoring = false;
+
+        try { _cts?.Cancel(); } catch { /* ignore */ }
         CleanupWatchers();
+
+        // Clear tracking state for potential restart
+        ResetStateForStop();
     }
 
     /// <summary>
@@ -162,9 +153,9 @@ public class SessionMonitor : IObservable<SessionRecord>, IDisposable
     /// </summary>
     public async Task ReadNewRecordsAsync(CancellationToken cancellationToken = default)
     {
-        var tasks = _trackedFiles.ToArray()
-            .Select(f => ReadNewLinesFromFileAsync(f, cancellationToken));
-        await Task.WhenAll(tasks);
+        var files = _trackedFiles.Keys.ToArray();
+        var tasks = files.Select(f => ReadNewLinesFromFileAsync(f, cancellationToken));
+        await Task.WhenAll(tasks).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -175,7 +166,38 @@ public class SessionMonitor : IObservable<SessionRecord>, IDisposable
         if (_currentSessionId == null) return null;
 
         var repository = new SessionRepository(Path.GetDirectoryName(_options.GetClaudeProjectsPath()));
-        return await repository.LoadSessionAsync(_currentSessionId, cancellationToken);
+        return await repository.LoadSessionAsync(_currentSessionId, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task PollLoopAsync(CancellationToken token)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(PollingIntervalMs));
+
+        while (!token.IsCancellationRequested && !_disposed && _isMonitoring)
+        {
+            try
+            {
+                await timer.WaitForNextTickAsync(token).ConfigureAwait(false);
+
+                if (_projectDirectory != null && !Directory.Exists(_projectDirectory))
+                    continue;
+
+                ScanForSessionFiles();
+
+                var files = _trackedFiles.Keys.ToArray();
+                var tasks = files.Select(f => ReadNewLinesFromFileAsync(f, token));
+                await Task.WhenAll(tasks).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // normal shutdown
+                break;
+            }
+            catch
+            {
+                // polling should be resilient; swallow
+            }
+        }
     }
 
     private void ScanForSessionFiles()
@@ -191,81 +213,76 @@ public class SessionMonitor : IObservable<SessionRecord>, IDisposable
             {
                 try
                 {
-                    var fileInfo = new FileInfo(file);
-                    if (fileInfo.CreationTimeUtc >= toleranceTime)
-                    {
+                    var info = new FileInfo(file);
+                    if (info.CreationTimeUtc >= toleranceTime)
                         TrackFile(file);
-                    }
                 }
                 catch
                 {
-                    // Ignore file access errors
+                    // ignore file access errors
                 }
             }
         }
         catch
         {
-            // Ignore scan errors
+            // ignore scan errors
         }
     }
 
-    private void TrackFile(string file)
+    private void TrackFile(string filePath)
     {
-        if (_trackedFiles.Add(file))
-        {
-            _filePositions[file] = 0;
+        if (!_trackedFiles.TryAdd(filePath, 0))
+            return;
 
-            var fileName = Path.GetFileNameWithoutExtension(file);
-            if (!fileName.StartsWith("agent-") && _sessionFilePath == null)
+        // Decide initial offset (include existing content or not)
+        long initialOffset = 0;
+        if (!_options.IncludeExistingContent)
+        {
+            try
             {
-                _currentSessionId = fileName;
-                _sessionFilePath = file;
-                _lastPosition = 0;
+                var info = new FileInfo(filePath);
+                initialOffset = info.Exists ? info.Length : 0;
+            }
+            catch
+            {
+                initialOffset = 0;
             }
         }
-    }
 
-    private void OnPollingTimerCallback(object? state)
-    {
-        if (_disposed || !_isMonitoring) return;
+        _fileReadOffsets[filePath] = initialOffset;
+        _fileTailBytes[filePath] = Array.Empty<byte>();
 
-        try
+        var fileName = Path.GetFileNameWithoutExtension(filePath);
+        if (!fileName.StartsWith("agent-", StringComparison.OrdinalIgnoreCase) && _sessionFilePath == null)
         {
-            if (_projectDirectory != null && !Directory.Exists(_projectDirectory))
-            {
-                return;
-            }
-
-            ScanForSessionFiles();
-
-            var tasks = _trackedFiles.ToArray()
-                .Select(f => ReadNewLinesFromFileAsync(f, CancellationToken.None));
-            Task.WhenAll(tasks).ConfigureAwait(false);
-        }
-        catch
-        {
-            // Ignore polling errors
+            _currentSessionId = fileName;
+            _sessionFilePath = filePath;
         }
     }
 
     private void StartWatchingSession(string sessionId)
     {
         var claudeProjectsDir = _options.GetClaudeProjectsPath();
-
         if (!Directory.Exists(claudeProjectsDir))
             return;
 
         var sessionFiles = Directory.GetFiles(claudeProjectsDir, $"{sessionId}.jsonl", SearchOption.AllDirectories);
         _sessionFilePath = sessionFiles.FirstOrDefault();
-
         if (_sessionFilePath == null)
             return;
 
         _currentSessionId = sessionId;
 
+        // If session id is explicit, use its directory as project directory (to pick up agent-*.jsonl too)
+        _projectDirectory = Path.GetDirectoryName(_sessionFilePath)!;
+        StartWatchingProjectDirectory(_projectDirectory);
+
+        TrackFile(_sessionFilePath);
+
         if (_options.IncludeExistingContent)
         {
-            _ = ReadNewLinesFromFileAsync(_sessionFilePath, CancellationToken.None);
+            // Best effort immediate read
+            _ = ReadNewLinesFromFileAsync(_sessionFilePath, _cts?.Token ?? CancellationToken.None);
         }
 
         var directory = Path.GetDirectoryName(_sessionFilePath)!;
@@ -294,21 +311,23 @@ public class SessionMonitor : IObservable<SessionRecord>, IDisposable
 
         _parentDirectoryWatcher.Created += (s, e) =>
         {
-            if (e.Name == targetSubdir)
-            {
-                _projectDirectory = e.FullPath;
-                StartWatchingProjectDirectory();
-            }
+            if (_disposed || !_isMonitoring) return;
+            if (e.Name != targetSubdir) return;
+
+            _projectDirectory = e.FullPath;
+            StartWatchingProjectDirectory(_projectDirectory);
         };
 
         _parentDirectoryWatcher.EnableRaisingEvents = true;
     }
 
-    private void StartWatchingProjectDirectory()
+    private void StartWatchingProjectDirectory(string directory)
     {
-        if (_projectDirectory == null || _disposed || !_isMonitoring) return;
+        if (_disposed || !_isMonitoring) return;
+        if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory)) return;
 
-        _projectDirectoryWatcher = new FileSystemWatcher(_projectDirectory, "*.jsonl")
+        _projectDirectoryWatcher?.Dispose();
+        _projectDirectoryWatcher = new FileSystemWatcher(directory, "*.jsonl")
         {
             NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName
         };
@@ -324,14 +343,13 @@ public class SessionMonitor : IObservable<SessionRecord>, IDisposable
 
         try
         {
-            var fileInfo = new FileInfo(e.FullPath);
+            var info = new FileInfo(e.FullPath);
             var toleranceTime = _watchStartTime.AddSeconds(-_options.NewFileToleranceSeconds);
-
-            if (fileInfo.CreationTimeUtc < toleranceTime)
+            if (info.CreationTimeUtc < toleranceTime)
                 return;
 
             TrackFile(e.FullPath);
-            _ = ReadNewLinesFromFileAsync(e.FullPath, CancellationToken.None);
+            _ = ReadNewLinesFromFileAsync(e.FullPath, _cts?.Token ?? CancellationToken.None);
         }
         catch (Exception ex)
         {
@@ -343,14 +361,13 @@ public class SessionMonitor : IObservable<SessionRecord>, IDisposable
     {
         if (_disposed || !_isMonitoring) return;
 
-        if (!_trackedFiles.Contains(e.FullPath))
+        if (!_trackedFiles.ContainsKey(e.FullPath))
         {
             try
             {
-                var fileInfo = new FileInfo(e.FullPath);
+                var info = new FileInfo(e.FullPath);
                 var toleranceTime = _watchStartTime.AddSeconds(-_options.NewFileToleranceSeconds);
-
-                if (fileInfo.CreationTimeUtc < toleranceTime)
+                if (info.CreationTimeUtc < toleranceTime)
                     return;
 
                 TrackFile(e.FullPath);
@@ -361,79 +378,183 @@ public class SessionMonitor : IObservable<SessionRecord>, IDisposable
             }
         }
 
-        _ = ReadNewLinesFromFileAsync(e.FullPath, CancellationToken.None);
+        _ = ReadNewLinesFromFileAsync(e.FullPath, _cts?.Token ?? CancellationToken.None);
     }
 
     private async Task ReadNewLinesFromFileAsync(string filePath, CancellationToken cancellationToken)
     {
-        if (_disposed || !_isMonitoring || !File.Exists(filePath)) return;
+        if (_disposed || !_isMonitoring) return;
+        if (!File.Exists(filePath)) return;
 
-        var fileLock = _fileLocks.GetOrAdd(filePath, _ => new SemaphoreSlim(1, 1));
+        var gate = _fileLocks.GetOrAdd(filePath, _ => new SemaphoreSlim(1, 1));
 
-        if (!await fileLock.WaitAsync(0, cancellationToken))
+        // non-blocking: if another read is already in progress for this file, skip
+        if (!await gate.WaitAsync(0, cancellationToken).ConfigureAwait(false))
             return;
 
         try
         {
-            if (!_filePositions.TryGetValue(filePath, out var lastPosition))
-            {
-                lastPosition = 0;
-                _filePositions[filePath] = 0;
-            }
+            var lastReadOffset = _fileReadOffsets.GetOrAdd(filePath, 0);
 
             await using var fs = new FileStream(
                 filePath,
                 FileMode.Open,
                 FileAccess.Read,
                 FileShare.ReadWrite,
-                bufferSize: 4096,
+                bufferSize: 64 * 1024,
                 useAsync: true);
 
-            if (fs.Length <= lastPosition)
+            // Handle truncation/reset
+            if (fs.Length < lastReadOffset)
+            {
+                lastReadOffset = 0;
+                _fileReadOffsets[filePath] = 0;
+                _fileTailBytes[filePath] = Array.Empty<byte>();
+            }
+
+            if (fs.Length <= lastReadOffset)
                 return;
 
-            fs.Seek(lastPosition, SeekOrigin.Begin);
-            using var reader = new StreamReader(fs, bufferSize: 4096);
+            fs.Seek(lastReadOffset, SeekOrigin.Begin);
 
-            string? line;
-            while ((line = await reader.ReadLineAsync(cancellationToken)) != null)
+            // Read bounded chunk
+            var toRead = (int)Math.Min(MaxReadBytesPerPass, fs.Length - lastReadOffset);
+            var newBytes = new byte[toRead];
+
+            var read = 0;
+            while (read < toRead)
             {
+                var n = await fs.ReadAsync(newBytes.AsMemory(read, toRead - read), cancellationToken).ConfigureAwait(false);
+                if (n == 0) break;
+                read += n;
+            }
+
+            if (read <= 0)
+                return;
+
+            if (read != toRead)
+                Array.Resize(ref newBytes, read);
+
+            // Advance "read offset" (we won't re-read these bytes again)
+            _fileReadOffsets[filePath] = lastReadOffset + read;
+
+            // Combine with any previous tail bytes (incomplete last line)
+            var tail = _fileTailBytes.GetOrAdd(filePath, Array.Empty<byte>());
+            byte[] combined;
+            if (tail.Length == 0)
+            {
+                combined = newBytes;
+            }
+            else
+            {
+                combined = new byte[tail.Length + newBytes.Length];
+                Buffer.BlockCopy(tail, 0, combined, 0, tail.Length);
+                Buffer.BlockCopy(newBytes, 0, combined, tail.Length, newBytes.Length);
+            }
+
+            // Find last newline in combined (we only process full lines)
+            var lastNewline = Array.LastIndexOf(combined, (byte)'\n');
+            if (lastNewline < 0)
+            {
+                // still no complete line; keep accumulating
+                _fileTailBytes[filePath] = combined;
+                return;
+            }
+
+            var commitLen = lastNewline + 1;
+
+            // Remaining bytes after last newline are the new tail
+            var remainingLen = combined.Length - commitLen;
+            if (remainingLen > 0)
+            {
+                var remaining = new byte[remainingLen];
+                Buffer.BlockCopy(combined, commitLen, remaining, 0, remainingLen);
+                _fileTailBytes[filePath] = remaining;
+            }
+            else
+            {
+                _fileTailBytes[filePath] = Array.Empty<byte>();
+            }
+
+            // Decode committed bytes (complete lines)
+            var text = Encoding.UTF8.GetString(combined, 0, commitLen);
+
+            // Split and parse
+            // Note: Split keeps empty last element if text ends with '\n', which is fine.
+            var lines = text.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            foreach (var raw in lines)
+            {
+                var line = raw.TrimEnd('\r');
                 if (string.IsNullOrWhiteSpace(line)) continue;
 
-                var record = SessionRecordParser.Parse(line);
-                if (record != null)
+                SessionRecord? record;
+                try
                 {
-                    _subject.OnNext(record);
+                    record = SessionRecordParser.Parse(line);
                 }
-            }
+                catch
+                {
+                    // If parsing fails, we emit nothing (best effort).
+                    // The line is "committed" already; if you want retry-on-failure,
+                    // store parse-failed lines in a separate queue.
+                    continue;
+                }
 
-            _filePositions[filePath] = fs.Position;
+                if (record == null) continue;
 
-            if (filePath == _sessionFilePath)
-            {
-                _lastPosition = fs.Position;
+                var recordKey = record.Uuid ?? $"{record.Type}_{record.Timestamp?.Ticks}_{StableHash(line)}";
+                if (!TryMarkSeen(recordKey))
+                    continue;
+
+                _subject.OnNext(record);
             }
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (OperationCanceledException)
+        {
+            // normal shutdown
+        }
+        catch (Exception ex)
         {
             OnError(ex);
         }
         finally
         {
-            fileLock.Release();
+            gate.Release();
         }
     }
 
-    private void OnError(Exception ex)
+    private bool TryMarkSeen(string key)
     {
-        Error?.Invoke(this, ex);
+        if (!_seenKeys.TryAdd(key, 0))
+            return false;
+
+        _seenOrder.Enqueue(key);
+
+        // Bound the set (best-effort)
+        while (_seenKeys.Count > _maxSeenKeys && _seenOrder.TryDequeue(out var old))
+        {
+            _seenKeys.TryRemove(old, out _);
+        }
+
+        return true;
     }
+
+    private static int StableHash(string s)
+    {
+        // Stable-ish hash (better than string.GetHashCode() across processes)
+        unchecked
+        {
+            var hash = 23;
+            for (var i = 0; i < s.Length; i++)
+                hash = (hash * 31) + s[i];
+            return hash;
+        }
+    }
+
+    private void OnError(Exception ex) => Error?.Invoke(this, ex);
 
     private void CleanupWatchers()
     {
-        _pollingTimer?.Dispose();
-        _pollingTimer = null;
-
         _parentDirectoryWatcher?.Dispose();
         _parentDirectoryWatcher = null;
 
@@ -444,22 +565,53 @@ public class SessionMonitor : IObservable<SessionRecord>, IDisposable
         _sessionFileWatcher = null;
     }
 
-    /// <summary>
-    /// Dispose and release all resources.
-    /// </summary>
+    private void ResetStateForStart()
+    {
+        _sessionFilePath = null;
+        _currentSessionId = null;
+
+        _trackedFiles.Clear();
+        _fileReadOffsets.Clear();
+        _fileTailBytes.Clear();
+
+        _seenKeys.Clear();
+        while (_seenOrder.TryDequeue(out _)) { }
+    }
+
+    private void ResetStateForStop()
+    {
+        _trackedFiles.Clear();
+        _fileReadOffsets.Clear();
+        _fileTailBytes.Clear();
+
+        _seenKeys.Clear();
+        while (_seenOrder.TryDequeue(out _)) { }
+
+        // keep _projectDirectory as-is (handy for restart), but you can null it if you prefer
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
 
         _isMonitoring = false;
+
+        try { _cts?.Cancel(); } catch { /* ignore */ }
+        _cts?.Dispose();
+        _cts = null;
+
         CleanupWatchers();
 
-        foreach (var fileLock in _fileLocks.Values)
-            fileLock.Dispose();
+        // Best effort wait for polling to stop
+        try { _pollingTask?.Wait(TimeSpan.FromSeconds(1)); } catch { /* ignore */ }
+        _pollingTask = null;
+
+        foreach (var sem in _fileLocks.Values)
+            sem.Dispose();
         _fileLocks.Clear();
 
-        _subject.OnCompleted();
-        _subject.Dispose();
+        _rawSubject.OnCompleted();
+        _rawSubject.Dispose();
     }
 }

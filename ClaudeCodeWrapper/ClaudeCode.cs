@@ -348,6 +348,71 @@ public class ClaudeCode : IDisposable
     }
 
     /// <summary>
+    /// Resume a previous session with detailed response (includes token metrics).
+    /// </summary>
+    public async Task<Response> ResumeWithResponseAsync(
+        string sessionId,
+        string prompt,
+        CancellationToken cancellationToken = default)
+    {
+        var original = _options.ResumeSessionId;
+        _options.ResumeSessionId = sessionId;
+
+        try
+        {
+            return await SendWithResponseAsync(prompt, cancellationToken);
+        }
+        finally
+        {
+            _options.ResumeSessionId = original;
+        }
+    }
+
+    /// <summary>
+    /// Resume a previous session with real-time activity streaming.
+    /// </summary>
+    public async Task<Response> ResumeWithStreamingAsync(
+        string sessionId,
+        string prompt,
+        Action<Activity> onActivity,
+        CancellationToken cancellationToken = default)
+    {
+        var original = _options.ResumeSessionId;
+        _options.ResumeSessionId = sessionId;
+
+        try
+        {
+            return await StreamWithResponseAsync(prompt, onActivity, cancellationToken);
+        }
+        finally
+        {
+            _options.ResumeSessionId = original;
+        }
+    }
+
+    /// <summary>
+    /// Resume a previous session with async activity handler.
+    /// </summary>
+    public async Task<Response> ResumeWithStreamingAsync(
+        string sessionId,
+        string prompt,
+        Func<Activity, Task> onActivityAsync,
+        CancellationToken cancellationToken = default)
+    {
+        var original = _options.ResumeSessionId;
+        _options.ResumeSessionId = sessionId;
+
+        try
+        {
+            return await StreamWithResponseAsync(prompt, onActivityAsync, cancellationToken);
+        }
+        finally
+        {
+            _options.ResumeSessionId = original;
+        }
+    }
+
+    /// <summary>
     /// Continue the last session.
     /// </summary>
     public async Task<string> ContinueAsync(string prompt, CancellationToken cancellationToken = default)
@@ -358,6 +423,68 @@ public class ClaudeCode : IDisposable
         try
         {
             return await SendAsync(prompt, cancellationToken);
+        }
+        finally
+        {
+            _options.ContinueLastSession = original;
+        }
+    }
+
+    /// <summary>
+    /// Continue the last session with detailed response (includes token metrics).
+    /// </summary>
+    public async Task<Response> ContinueWithResponseAsync(
+        string prompt,
+        CancellationToken cancellationToken = default)
+    {
+        var original = _options.ContinueLastSession;
+        _options.ContinueLastSession = true;
+
+        try
+        {
+            return await SendWithResponseAsync(prompt, cancellationToken);
+        }
+        finally
+        {
+            _options.ContinueLastSession = original;
+        }
+    }
+
+    /// <summary>
+    /// Continue the last session with real-time activity streaming.
+    /// </summary>
+    public async Task<Response> ContinueWithStreamingAsync(
+        string prompt,
+        Action<Activity> onActivity,
+        CancellationToken cancellationToken = default)
+    {
+        var original = _options.ContinueLastSession;
+        _options.ContinueLastSession = true;
+
+        try
+        {
+            return await StreamWithResponseAsync(prompt, onActivity, cancellationToken);
+        }
+        finally
+        {
+            _options.ContinueLastSession = original;
+        }
+    }
+
+    /// <summary>
+    /// Continue the last session with async activity handler.
+    /// </summary>
+    public async Task<Response> ContinueWithStreamingAsync(
+        string prompt,
+        Func<Activity, Task> onActivityAsync,
+        CancellationToken cancellationToken = default)
+    {
+        var original = _options.ContinueLastSession;
+        _options.ContinueLastSession = true;
+
+        try
+        {
+            return await StreamWithResponseAsync(prompt, onActivityAsync, cancellationToken);
         }
         finally
         {

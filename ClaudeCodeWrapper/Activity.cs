@@ -20,6 +20,12 @@ public record Activity
     public string? Tool { get; init; }
 
     /// <summary>
+    /// Tool use ID for correlating tool_call with tool_result.
+    /// This is the unique identifier from ToolUseBlock.Id / ToolResultBlock.ToolUseId.
+    /// </summary>
+    public string? ToolUseId { get; init; }
+
+    /// <summary>
     /// Tool input/arguments summary.
     /// </summary>
     public string? Input { get; init; }
@@ -156,6 +162,7 @@ public record Activity
                     {
                         Type = "tool_call",
                         Tool = toolUse.Name,
+                        ToolUseId = toolUse.Id, // ✅ Correlation key for matching with tool_result
                         Input = toolUse.Input?.GetRawText(),
                         Timestamp = record.Timestamp,
                         SessionId = record.SessionId,
@@ -235,6 +242,7 @@ public record Activity
                     yield return new Activity
                     {
                         Type = "tool_result",
+                        ToolUseId = toolResult.ToolUseId, // ✅ Correlation key for matching with tool_call
                         Content = toolResult.Content,
                         Success = !toolResult.IsError,
                         Timestamp = record.Timestamp,

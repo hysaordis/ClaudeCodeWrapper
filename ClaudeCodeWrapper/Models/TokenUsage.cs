@@ -56,18 +56,31 @@ public record TokenUsage
     public int TotalTokens => InputTokens + OutputTokens;
 
     /// <summary>
-    /// Effective input tokens (excluding cache reads).
+    /// Total input context tokens (processed + cache read).
+    /// This represents the full context size sent to the model.
     /// </summary>
     [JsonIgnore]
-    public int EffectiveInputTokens => InputTokens - CacheReadInputTokens;
+    public int TotalInputContext => InputTokens + CacheReadInputTokens;
 
     /// <summary>
-    /// Cache hit rate (0-1).
+    /// Effective input tokens (new tokens not from cache - actual cost).
     /// </summary>
     [JsonIgnore]
-    public double CacheHitRate => InputTokens > 0
-        ? (double)CacheReadInputTokens / InputTokens
-        : 0;
+    public int EffectiveInputTokens => InputTokens;
+
+    /// <summary>
+    /// Cache hit rate (0-1). Ratio of tokens read from cache vs total context.
+    /// Formula: CacheReadInputTokens / (InputTokens + CacheReadInputTokens)
+    /// </summary>
+    [JsonIgnore]
+    public double CacheHitRate
+    {
+        get
+        {
+            var total = InputTokens + CacheReadInputTokens;
+            return total > 0 ? (double)CacheReadInputTokens / total : 0;
+        }
+    }
 }
 
 /// <summary>

@@ -247,7 +247,47 @@ public class ClaudeCode : IDisposable
     }
 
     /// <summary>
+    /// Send a prompt, stream raw session records with async handler, and get detailed response.
+    /// Ensures all callback Tasks complete before returning.
+    /// </summary>
+    public async Task<Response> StreamRecordsWithResponseAsync(
+        string prompt,
+        Func<SessionRecord, Task> onRecordAsync,
+        CancellationToken cancellationToken = default)
+    {
+        using var monitor = CreateMonitor();
+        var errors = new System.Collections.Concurrent.ConcurrentBag<Exception>();
+        var pendingTasks = new System.Collections.Concurrent.ConcurrentBag<Task>();
+
+        monitor.Error += (_, ex) => errors.Add(ex);
+        using var subscription = monitor.Subscribe(record =>
+        {
+            var task = Task.Run(async () =>
+            {
+                try { await onRecordAsync(record); }
+                catch (Exception ex) { errors.Add(ex); }
+            }, cancellationToken);
+            pendingTasks.Add(task);
+        });
+
+        monitor.Start();
+        var result = await SendWithResponseAsync(prompt, cancellationToken);
+
+        // Wait for final events to be captured by polling
+        await Task.Delay(FinalEventsDelayMs, cancellationToken);
+
+        // Wait for all pending callback tasks to complete
+        await Task.WhenAll(pendingTasks);
+
+        if (!errors.IsEmpty)
+            throw new AggregateException("Errors occurred during monitoring", errors);
+
+        return result;
+    }
+
+    /// <summary>
     /// Send a prompt with async activity handler.
+    /// Ensures all callback Tasks complete before returning.
     /// </summary>
     public async Task<Response> StreamWithResponseAsync(
         string prompt,
@@ -256,23 +296,30 @@ public class ClaudeCode : IDisposable
     {
         using var monitor = CreateMonitor();
         var errors = new System.Collections.Concurrent.ConcurrentBag<Exception>();
+        var pendingTasks = new System.Collections.Concurrent.ConcurrentBag<Task>();
 
         monitor.Error += (_, ex) => errors.Add(ex);
         using var subscription = monitor.Subscribe(record =>
         {
             foreach (var activity in Activity.FromRecord(record))
             {
-                _ = Task.Run(async () =>
+                var task = Task.Run(async () =>
                 {
                     try { await onActivityAsync(activity); }
                     catch (Exception ex) { errors.Add(ex); }
                 }, cancellationToken);
+                pendingTasks.Add(task);
             }
         });
 
         monitor.Start();
         var result = await SendWithResponseAsync(prompt, cancellationToken);
+
+        // Wait for final events to be captured by polling
         await Task.Delay(FinalEventsDelayMs, cancellationToken);
+
+        // Wait for all pending callback tasks to complete
+        await Task.WhenAll(pendingTasks);
 
         if (!errors.IsEmpty)
             throw new AggregateException("Errors occurred during monitoring", errors);
@@ -413,6 +460,50 @@ public class ClaudeCode : IDisposable
     }
 
     /// <summary>
+    /// Resume a previous session with full record streaming (includes tool_use, tool_result blocks).
+    /// </summary>
+    public async Task<Response> ResumeWithRecordsStreamingAsync(
+        string sessionId,
+        string prompt,
+        Action<SessionRecord> onRecord,
+        CancellationToken cancellationToken = default)
+    {
+        var original = _options.ResumeSessionId;
+        _options.ResumeSessionId = sessionId;
+
+        try
+        {
+            return await StreamRecordsWithResponseAsync(prompt, onRecord, cancellationToken);
+        }
+        finally
+        {
+            _options.ResumeSessionId = original;
+        }
+    }
+
+    /// <summary>
+    /// Resume a previous session with async full record streaming (includes tool_use, tool_result blocks).
+    /// </summary>
+    public async Task<Response> ResumeWithRecordsStreamingAsync(
+        string sessionId,
+        string prompt,
+        Func<SessionRecord, Task> onRecordAsync,
+        CancellationToken cancellationToken = default)
+    {
+        var original = _options.ResumeSessionId;
+        _options.ResumeSessionId = sessionId;
+
+        try
+        {
+            return await StreamRecordsWithResponseAsync(prompt, onRecordAsync, cancellationToken);
+        }
+        finally
+        {
+            _options.ResumeSessionId = original;
+        }
+    }
+
+    /// <summary>
     /// Continue the last session.
     /// </summary>
     public async Task<string> ContinueAsync(string prompt, CancellationToken cancellationToken = default)
@@ -501,7 +592,8 @@ public class ClaudeCode : IDisposable
         return new Core.SessionMonitor(new SessionMonitorOptions
         {
             WorkingDirectory = _options.WorkingDirectory,
-            IncludeExistingContent = false,
+            SessionId = _options.ResumeSessionId, // Pass session ID for resume scenarios
+            IncludeExistingContent = false, // Only capture new records (not existing history)
             NewFileToleranceSeconds = 2
         });
     }
